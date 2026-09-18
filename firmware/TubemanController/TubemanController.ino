@@ -11,7 +11,7 @@
 
 #include "index_html.h"
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1"
 
 constexpr uint8_t FAN_PIN = D1;
 constexpr bool FAN_ACTIVE_HIGH = true;
@@ -30,7 +30,7 @@ constexpr uint32_t MAX_PULSE_INTERVAL_SEC = 3600;
 constexpr uint16_t MIN_PULSE_OFF_MS = 50;
 constexpr uint16_t MAX_PULSE_OFF_MS = 3000;
 
-const char* GITHUB_RELEASE_API = "https://api.github.com/repos/iamvinyl/TubemanController/releases/latest";
+const char* VERSION_URL = "https://raw.githubusercontent.com/iamvinyl/TubemanController/main/VERSION";
 const char* GITHUB_ASSET_NAME = "tubeman-controller.bin";
 
 struct DeviceConfigV3 {
@@ -69,7 +69,13 @@ uint32_t behaviorPulseStartedAt = 0;
 uint32_t lastBehaviorPulseAt = 0;
 uint32_t behaviorPulseCount = 0;
 uint32_t udpPacketCount = 0;
+uint32_t udpTxCount = 0;
 uint32_t webCommandCount = 0;
+IPAddress lastUdpClientIp;
+uint16_t lastUdpClientPort = 0;
+bool hasUdpClient = false;
+
+void broadcastUdpState();
 
 constexpr size_t LOG_CAPACITY = 50;
 String eventLog[LOG_CAPACITY];
@@ -228,6 +234,7 @@ void setFan(bool enabled, const String& source) {
   bool changed = fanOn != enabled; fanOn = enabled; behaviorPulseActive = false; writeFanOutput(enabled);
   if (enabled) lastBehaviorPulseAt = millis();
   String m = source + " set fan " + (fanOn ? "ON" : "OFF"); if (!changed) m += " (no change)"; addLog(m);
+  if (changed) broadcastUdpState();
 }
 
 void startBehaviorPulse(const String& source) {
@@ -316,88 +323,20 @@ String jsonField(const String& body, const String& key, int startAt = 0) {
 }
 
 bool checkGitHubUpdate() {
-  if (WiFi.status() != WL_CONNECTED) {
-    firmwareStatus = "unavailable";
-    firmwareError = "Wi-Fi not connected";
-    return false;
-  }
-
-  firmwareStatus = "checking";
-  firmwareError = "";
-  latestVersion = "";
-  latestDownloadUrl = "";
-
-  BearSSL::WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  http.useHTTP10(true); // Avoid chunked transfer parsing issues on ESP8266.
-  http.setTimeout(10000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-  if (!http.begin(client, GITHUB_RELEASE_API)) {
-    firmwareStatus = "error";
-    firmwareError = "Could not start GitHub request";
-    addLog("Firmware check failed: " + firmwareError);
-    return false;
-  }
-
-  http.addHeader("Accept", "application/vnd.github+json");
-  http.addHeader("Accept-Encoding", "identity"); // Request plain JSON, not gzip/compressed content.
-  http.addHeader("User-Agent", "TubemanController/" FIRMWARE_VERSION);
-  http.addHeader("X-GitHub-Api-Version", "2022-11-28");
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    firmwareStatus = "error";
-    firmwareError = "GitHub returned HTTP " + String(code);
-    http.end();
-    addLog("Firmware check failed: " + firmwareError);
-    return false;
-  }
-
-  int expectedLength = http.getSize();
-  String body = http.getString();
-  http.end();
-
-  addLog("GitHub release response: " + String(body.length()) + " bytes" +
-         (expectedLength > 0 ? " / expected " + String(expectedLength) : ""));
-
-  if (!body.length()) {
-    firmwareStatus = "error";
-    firmwareError = "GitHub returned an empty release response";
-    addLog("Firmware check failed: " + firmwareError);
-    return false;
-  }
-
-  latestVersion = jsonField(body, "tag_name");
-
-  // Fallback: recover the version from the release html_url if tag_name parsing
-  // ever fails. GitHub formats it as .../releases/tag/v1.2.3.
-  if (!latestVersion.length()) {
-    String htmlUrl = jsonField(body, "html_url");
-    int tagPos = htmlUrl.indexOf("/releases/tag/");
-    if (tagPos >= 0) latestVersion = htmlUrl.substring(tagPos + 14);
-  }
-
-  if (!latestVersion.length()) {
-    firmwareStatus = "error";
-    firmwareError = "Could not parse latest release version";
-    String preview = body.substring(0, body.length() > 180 ? 180 : body.length());
-    preview.replace("\n", " ");
-    preview.replace("\r", " ");
-    addLog("Firmware check failed: " + firmwareError + " | JSON: " + preview);
-    return false;
-  }
-
-  // Public GitHub release assets have a deterministic URL. Building it from the
-  // version tag avoids fragile scanning of GitHub's nested assets JSON.
-  latestDownloadUrl = "https://github.com/iamvinyl/TubemanController/releases/download/" +
-                      latestVersion + "/" + GITHUB_ASSET_NAME;
-
-  firmwareStatus = compareVersions(FIRMWARE_VERSION, latestVersion) < 0 ? "available" : "current";
-  addLog("Firmware check: installed " FIRMWARE_VERSION ", latest " + latestVersion +
-         (firmwareStatus == "available" ? " (update available)" : " (up to date)"));
+  if (WiFi.status() != WL_CONNECTED) { firmwareStatus = "unavailable"; firmwareError = "Wi-Fi not connected"; return false; }
+  firmwareStatus = "checking"; firmwareError = ""; latestVersion = ""; latestDownloadUrl = "";
+  BearSSL::WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(8000); http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, VERSION_URL)) { firmwareStatus="error"; firmwareError="Could not start version request"; addLog("Firmware check failed: "+firmwareError); return false; }
+  http.addHeader("Accept","text/plain"); http.addHeader("Accept-Encoding","identity"); http.addHeader("Cache-Control","no-cache"); http.addHeader("User-Agent","TubemanController/" FIRMWARE_VERSION);
+  int code=http.GET();
+  if(code!=HTTP_CODE_OK){ firmwareStatus="error"; firmwareError="Version file returned HTTP "+String(code); http.end(); addLog("Firmware check failed: "+firmwareError); return false; }
+  latestVersion=http.getString(); http.end(); latestVersion.trim(); if(latestVersion.startsWith("v")) latestVersion.remove(0,1);
+  if(!latestVersion.length()){ firmwareStatus="error"; firmwareError="VERSION file was empty"; addLog("Firmware check failed: "+firmwareError); return false; }
+  for(size_t i=0;i<latestVersion.length();i++){ char c=latestVersion.charAt(i); if(!((c>='0'&&c<='9')||c=='.')){ firmwareStatus="error"; firmwareError="VERSION file contains an invalid version"; latestVersion=""; return false; } }
+  latestDownloadUrl="https://github.com/iamvinyl/TubemanController/releases/download/v"+latestVersion+"/"+GITHUB_ASSET_NAME;
+  firmwareStatus=compareVersions(FIRMWARE_VERSION,latestVersion)<0?"available":"current";
+  addLog("Firmware check: installed " FIRMWARE_VERSION ", latest "+latestVersion+(firmwareStatus=="available"?" (update available)":" (up to date)"));
   return true;
 }
 
@@ -424,7 +363,7 @@ void handleStatus() {
   json += "\"fanOn\":" + String(fanOn ? "true" : "false") + ",\"fanOutputOn\":" + String(fanOutputOn ? "true" : "false") + ",\"pulseActive\":" + String(behaviorPulseActive ? "true" : "false") + ",";
   json += "\"ip\":\"" + jsonEscape(currentIpAddress()) + "\",\"wifiMode\":\"" + jsonEscape(wifiModeText()) + "\",\"ssid\":\"" + jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : setupApSsid) + "\",\"savedSsid\":\"" + jsonEscape(config.ssid) + "\",";
   json += "\"hostname\":\"" + jsonEscape(config.hostname) + "\",\"localUrl\":\"http://" + jsonEscape(config.hostname) + ".local/\",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + ",";
-  json += "\"udpPort\":" + String(config.udpPort) + ",\"udpPackets\":" + String(udpPacketCount) + ",\"webCommands\":" + String(webCommandCount) + ",";
+  json += "\"udpPort\":" + String(config.udpPort) + ",\"udpPackets\":" + String(udpPacketCount) + ",\"udpTxPackets\":" + String(udpTxCount) + ",\"udpClientKnown\":" + String(hasUdpClient ? "true" : "false") + ",\"webCommands\":" + String(webCommandCount) + ",";
   json += "\"behaviorMode\":" + String(config.behaviorMode) + ",\"behaviorModeText\":\"" + behaviorModeText() + "\",\"pulseIntervalSec\":" + String(config.pulseIntervalSec) + ",\"pulseOffMs\":" + String(config.pulseOffMs) + ",\"pulseCount\":" + String(behaviorPulseCount) + ",";
   json += "\"firmwareVersion\":\"" FIRMWARE_VERSION "\",\"latestVersion\":\"" + jsonEscape(latestVersion) + "\",\"firmwareStatus\":\"" + jsonEscape(firmwareStatus) + "\",\"firmwareError\":\"" + jsonEscape(firmwareError) + "\",";
   json += "\"uptime\":\"" + jsonEscape(uptimeText()) + "\"}";
@@ -509,12 +448,25 @@ void setupWebServer() {
   addLog("Web UI started: http://" + currentIpAddress() + "/");
 }
 
-void sendUdpReply(const IPAddress& ip, uint16_t port, const String& response) { udp.beginPacket(ip, port); udp.print(response); udp.endPacket(); }
+void sendUdpReply(const IPAddress& ip, uint16_t port, const String& response) {
+  if (!udpRunning || !port) return;
+  if (udp.beginPacket(ip, port)) { udp.print(response); if (udp.endPacket()) udpTxCount++; }
+}
+void broadcastUdpState() {
+  if (!hasUdpClient || !lastUdpClientPort) return;
+  String state=fanOn?"state|on":"state|off";
+  sendUdpReply(lastUdpClientIp,lastUdpClientPort,state);
+  addLog("UDP state -> "+lastUdpClientIp.toString()+":"+String(lastUdpClientPort)+" \""+state+"\"");
+}
 void handleUdp() {
-  if (!udpRunning) return; int packetSize = udp.parsePacket(); if (packetSize <= 0) return;
-  char buf[129]; int n = udp.read(buf, sizeof(buf)-1); if (n <= 0) return; buf[n] = 0;
-  IPAddress ip = udp.remoteIP(); uint16_t port = udp.remotePort(); String raw(buf); String source = "UDP " + ip.toString() + ":" + String(port);
-  udpPacketCount++; addLog(source + " received \"" + raw + "\""); String response = executeCommand(raw, source); sendUdpReply(ip, port, response); addLog(source + " reply \"" + response + "\"");
+  if (!udpRunning) return; int packetSize=udp.parsePacket(); if(packetSize<=0)return;
+  char buf[129]; int n=udp.read(buf,sizeof(buf)-1); if(n<=0)return; buf[n]=0;
+  IPAddress ip=udp.remoteIP(); uint16_t port=udp.remotePort();
+  lastUdpClientIp=ip; lastUdpClientPort=port; hasUdpClient=true;
+  String raw(buf); String source="UDP "+ip.toString()+":"+String(port);
+  udpPacketCount++; addLog(source+" received \""+raw+"\"");
+  String response=executeCommand(raw,source); sendUdpReply(ip,port,response); addLog(source+" reply \""+response+"\"");
+  if(response=="fan:on"||response=="fan:off"){ String state=fanOn?"state|on":"state|off"; sendUdpReply(ip,port,state); addLog(source+" confirm \""+state+"\""); }
 }
 
 void setup() {
