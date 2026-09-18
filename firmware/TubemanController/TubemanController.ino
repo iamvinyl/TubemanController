@@ -11,7 +11,7 @@
 
 #include "index_html.h"
 
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.0.2"
 
 constexpr uint8_t FAN_PIN = D1;
 constexpr bool FAN_ACTIVE_HIGH = true;
@@ -21,6 +21,7 @@ constexpr size_t EEPROM_SIZE = 512;
 
 constexpr uint32_t CONFIG_MAGIC_V3 = 0x46414E33; // FAN3
 constexpr uint32_t CONFIG_MAGIC_V4 = 0x46414E34; // FAN4
+constexpr uint32_t CONFIG_MAGIC_V5 = 0x46414E35; // FAN5
 constexpr uint8_t BEHAVIOR_STEADY = 0;
 constexpr uint8_t BEHAVIOR_ANTISTALL = 1;
 constexpr uint32_t DEFAULT_PULSE_INTERVAL_SEC = 45;
@@ -44,7 +45,7 @@ struct DeviceConfigV3 {
   uint8_t reserved[24];
 };
 
-struct DeviceConfig {
+struct DeviceConfigV4 {
   uint32_t magic;
   char ssid[33];
   char password[65];
@@ -54,6 +55,21 @@ struct DeviceConfig {
   uint32_t pulseIntervalSec;
   uint16_t pulseOffMs;
   uint8_t reserved[12];
+};
+
+struct DeviceConfig {
+  uint32_t magic;
+  char ssid[33];
+  char password[65];
+  char hostname[33];
+  uint16_t udpPort;
+  uint8_t behaviorMode;
+  uint32_t pulseIntervalSec;
+  uint16_t pulseOffMs;
+  uint8_t statusReplyEnabled;
+  char statusReplyIp[16];
+  uint16_t statusReplyPort;
+  uint8_t reserved[8];
 };
 
 DeviceConfig config;
@@ -166,16 +182,18 @@ void addLog(const String& message) {
 
 void setDefaultConfig() {
   memset(&config, 0, sizeof(config));
-  config.magic = CONFIG_MAGIC_V4;
+  config.magic = CONFIG_MAGIC_V5;
   defaultHostname().toCharArray(config.hostname, sizeof(config.hostname));
   config.udpPort = DEFAULT_UDP_PORT;
   config.behaviorMode = BEHAVIOR_STEADY;
+  config.statusReplyEnabled = 0;
+  config.statusReplyPort = 4211;
   config.pulseIntervalSec = DEFAULT_PULSE_INTERVAL_SEC;
   config.pulseOffMs = DEFAULT_PULSE_OFF_MS;
 }
 
 bool commitConfig() {
-  config.magic = CONFIG_MAGIC_V4;
+  config.magic = CONFIG_MAGIC_V5;
   EEPROM.put(0, config);
   return EEPROM.commit();
 }
@@ -183,8 +201,19 @@ bool commitConfig() {
 void loadConfig() {
   EEPROM.begin(EEPROM_SIZE);
   uint32_t storedMagic = 0; EEPROM.get(0, storedMagic);
-  if (storedMagic == CONFIG_MAGIC_V4) {
+  if (storedMagic == CONFIG_MAGIC_V5) {
     EEPROM.get(0, config);
+  } else if (storedMagic == CONFIG_MAGIC_V4) {
+    DeviceConfigV4 oldConfig; EEPROM.get(0, oldConfig);
+    setDefaultConfig();
+    strncpy(config.ssid, oldConfig.ssid, sizeof(config.ssid) - 1);
+    strncpy(config.password, oldConfig.password, sizeof(config.password) - 1);
+    strncpy(config.hostname, oldConfig.hostname, sizeof(config.hostname) - 1);
+    config.udpPort = oldConfig.udpPort ? oldConfig.udpPort : DEFAULT_UDP_PORT;
+    config.behaviorMode = oldConfig.behaviorMode;
+    config.pulseIntervalSec = oldConfig.pulseIntervalSec;
+    config.pulseOffMs = oldConfig.pulseOffMs;
+    commitConfig(); addLog("Migrated FAN4 settings to FAN5");
   } else if (storedMagic == CONFIG_MAGIC_V3) {
     DeviceConfigV3 oldConfig; EEPROM.get(0, oldConfig);
     setDefaultConfig();
@@ -194,26 +223,25 @@ void loadConfig() {
     config.behaviorMode = oldConfig.behaviorMode;
     config.pulseIntervalSec = oldConfig.pulseIntervalSec;
     config.pulseOffMs = oldConfig.pulseOffMs;
-    commitConfig();
-    addLog("Migrated settings to current format");
-  } else {
-    setDefaultConfig(); commitConfig();
-  }
-  config.ssid[32] = 0; config.password[64] = 0; config.hostname[32] = 0;
-  String host = sanitizeHostname(config.hostname);
-  host.toCharArray(config.hostname, sizeof(config.hostname));
-  if (!config.udpPort) config.udpPort = DEFAULT_UDP_PORT;
-  if (config.behaviorMode > BEHAVIOR_ANTISTALL) config.behaviorMode = BEHAVIOR_STEADY;
-  if (config.pulseIntervalSec < MIN_PULSE_INTERVAL_SEC || config.pulseIntervalSec > MAX_PULSE_INTERVAL_SEC) config.pulseIntervalSec = DEFAULT_PULSE_INTERVAL_SEC;
-  if (config.pulseOffMs < MIN_PULSE_OFF_MS || config.pulseOffMs > MAX_PULSE_OFF_MS) config.pulseOffMs = DEFAULT_PULSE_OFF_MS;
+    commitConfig(); addLog("Migrated FAN3 settings to FAN5");
+  } else { setDefaultConfig(); commitConfig(); }
+  config.ssid[32]=0; config.password[64]=0; config.hostname[32]=0; config.statusReplyIp[15]=0;
+  String host=sanitizeHostname(config.hostname); host.toCharArray(config.hostname,sizeof(config.hostname));
+  if(!config.udpPort) config.udpPort=DEFAULT_UDP_PORT;
+  if(config.behaviorMode>BEHAVIOR_ANTISTALL) config.behaviorMode=BEHAVIOR_STEADY;
+  if(config.pulseIntervalSec<MIN_PULSE_INTERVAL_SEC||config.pulseIntervalSec>MAX_PULSE_INTERVAL_SEC) config.pulseIntervalSec=DEFAULT_PULSE_INTERVAL_SEC;
+  if(config.pulseOffMs<MIN_PULSE_OFF_MS||config.pulseOffMs>MAX_PULSE_OFF_MS) config.pulseOffMs=DEFAULT_PULSE_OFF_MS;
+  if(!config.statusReplyPort) config.statusReplyPort=4211;
+  config.statusReplyEnabled=config.statusReplyEnabled?1:0;
 }
 
-bool saveNetworkConfig(const String& ssid, const String& password, uint16_t port, const String& hostname) {
-  if (!ssid.length() || ssid.length() > 32 || password.length() > 64 || !port) return false;
-  String cleanHost = sanitizeHostname(hostname);
-  memset(config.ssid, 0, sizeof(config.ssid)); memset(config.password, 0, sizeof(config.password)); memset(config.hostname, 0, sizeof(config.hostname));
-  ssid.toCharArray(config.ssid, sizeof(config.ssid)); password.toCharArray(config.password, sizeof(config.password)); cleanHost.toCharArray(config.hostname, sizeof(config.hostname));
-  config.udpPort = port;
+bool saveNetworkConfig(const String& ssid, const String& password, uint16_t port, const String& hostname, bool replyEnabled, const String& replyIp, uint16_t replyPort) {
+  if (!ssid.length() || ssid.length()>32 || password.length()>64 || !port || (replyEnabled && (!replyIp.length() || !replyPort))) return false;
+  if(replyEnabled){ IPAddress parsed; if(!parsed.fromString(replyIp)) return false; }
+  String cleanHost=sanitizeHostname(hostname);
+  memset(config.ssid,0,sizeof(config.ssid)); memset(config.password,0,sizeof(config.password)); memset(config.hostname,0,sizeof(config.hostname)); memset(config.statusReplyIp,0,sizeof(config.statusReplyIp));
+  ssid.toCharArray(config.ssid,sizeof(config.ssid)); password.toCharArray(config.password,sizeof(config.password)); cleanHost.toCharArray(config.hostname,sizeof(config.hostname)); replyIp.toCharArray(config.statusReplyIp,sizeof(config.statusReplyIp));
+  config.udpPort=port; config.statusReplyEnabled=replyEnabled?1:0; config.statusReplyPort=replyPort?replyPort:4211;
   return commitConfig();
 }
 
@@ -363,7 +391,7 @@ void handleStatus() {
   json += "\"fanOn\":" + String(fanOn ? "true" : "false") + ",\"fanOutputOn\":" + String(fanOutputOn ? "true" : "false") + ",\"pulseActive\":" + String(behaviorPulseActive ? "true" : "false") + ",";
   json += "\"ip\":\"" + jsonEscape(currentIpAddress()) + "\",\"wifiMode\":\"" + jsonEscape(wifiModeText()) + "\",\"ssid\":\"" + jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : setupApSsid) + "\",\"savedSsid\":\"" + jsonEscape(config.ssid) + "\",";
   json += "\"hostname\":\"" + jsonEscape(config.hostname) + "\",\"localUrl\":\"http://" + jsonEscape(config.hostname) + ".local/\",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + ",";
-  json += "\"udpPort\":" + String(config.udpPort) + ",\"udpPackets\":" + String(udpPacketCount) + ",\"udpTxPackets\":" + String(udpTxCount) + ",\"udpClientKnown\":" + String(hasUdpClient ? "true" : "false") + ",\"webCommands\":" + String(webCommandCount) + ",";
+  json += "\"udpPort\":" + String(config.udpPort) + ",\"statusReplyEnabled\":" + String(config.statusReplyEnabled ? "true" : "false") + ",\"statusReplyIp\":\"" + jsonEscape(config.statusReplyIp) + "\",\"statusReplyPort\":" + String(config.statusReplyPort) + ",\"udpPackets\":" + String(udpPacketCount) + ",\"udpTxPackets\":" + String(udpTxCount) + ",\"udpClientKnown\":" + String(hasUdpClient ? "true" : "false") + ",\"webCommands\":" + String(webCommandCount) + ",";
   json += "\"behaviorMode\":" + String(config.behaviorMode) + ",\"behaviorModeText\":\"" + behaviorModeText() + "\",\"pulseIntervalSec\":" + String(config.pulseIntervalSec) + ",\"pulseOffMs\":" + String(config.pulseOffMs) + ",\"pulseCount\":" + String(behaviorPulseCount) + ",";
   json += "\"firmwareVersion\":\"" FIRMWARE_VERSION "\",\"latestVersion\":\"" + jsonEscape(latestVersion) + "\",\"firmwareStatus\":\"" + jsonEscape(firmwareStatus) + "\",\"firmwareError\":\"" + jsonEscape(firmwareError) + "\",";
   json += "\"uptime\":\"" + jsonEscape(uptimeText()) + "\"}";
@@ -409,11 +437,11 @@ bool testWifiCredentials(const String& ssid, const String& password, IPAddress& 
 
 void handleSaveSettings() {
   if (!server.hasArg("ssid") || !server.hasArg("udpPort") || !server.hasArg("hostname")) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing-fields\"}"); return; }
-  String ssid = server.arg("ssid"); ssid.trim(); String password = server.hasArg("password") ? server.arg("password") : ""; String hostname = sanitizeHostname(server.arg("hostname")); long port = server.arg("udpPort").toInt();
-  if (!ssid.length() || ssid.length() > 32 || password.length() > 64 || port < 1 || port > 65535) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid-settings\"}"); return; }
+  String ssid = server.arg("ssid"); ssid.trim(); String password = server.hasArg("password") ? server.arg("password") : ""; String hostname = sanitizeHostname(server.arg("hostname")); long port = server.arg("udpPort").toInt(); bool replyEnabled = server.hasArg("statusReplyEnabled") && server.arg("statusReplyEnabled") == "1"; String replyIp = server.hasArg("statusReplyIp") ? server.arg("statusReplyIp") : ""; replyIp.trim(); long replyPort = server.hasArg("statusReplyPort") ? server.arg("statusReplyPort").toInt() : 4211;
+  if (!ssid.length() || ssid.length() > 32 || password.length() > 64 || port < 1 || port > 65535 || replyPort < 1 || replyPort > 65535) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid-settings\"}"); return; }
   if (!password.length() && ssid == String(config.ssid)) password = String(config.password);
   IPAddress newIp; if (!testWifiCredentials(ssid, password, newIp)) { server.send(422, "application/json", "{\"ok\":false,\"error\":\"wifi-connect-failed\"}"); return; }
-  if (!saveNetworkConfig(ssid, password, (uint16_t)port, hostname)) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"save-failed\"}"); return; }
+  if (!saveNetworkConfig(ssid, password, (uint16_t)port, hostname, replyEnabled, replyIp, (uint16_t)replyPort)) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"save-failed\"}"); return; }
   addLog("Network settings saved");
   String json = "{\"ok\":true,\"newIp\":\"" + newIp.toString() + "\",\"localUrl\":\"http://" + hostname + ".local/\"}"; server.send(200, "application/json", json); scheduleRestart();
 }
@@ -453,10 +481,11 @@ void sendUdpReply(const IPAddress& ip, uint16_t port, const String& response) {
   if (udp.beginPacket(ip, port)) { udp.print(response); if (udp.endPacket()) udpTxCount++; }
 }
 void broadcastUdpState() {
-  if (!hasUdpClient || !lastUdpClientPort) return;
+  if (!config.statusReplyEnabled || !strlen(config.statusReplyIp) || !config.statusReplyPort) return;
+  IPAddress ip; if(!ip.fromString(config.statusReplyIp)) return;
   String state=fanOn?"state|on":"state|off";
-  sendUdpReply(lastUdpClientIp,lastUdpClientPort,state);
-  addLog("UDP state -> "+lastUdpClientIp.toString()+":"+String(lastUdpClientPort)+" \""+state+"\"");
+  sendUdpReply(ip,config.statusReplyPort,state);
+  addLog("UDP status -> "+ip.toString()+":"+String(config.statusReplyPort)+" \""+state+"\"");
 }
 void handleUdp() {
   if (!udpRunning) return; int packetSize=udp.parsePacket(); if(packetSize<=0)return;
@@ -466,7 +495,7 @@ void handleUdp() {
   String raw(buf); String source="UDP "+ip.toString()+":"+String(port);
   udpPacketCount++; addLog(source+" received \""+raw+"\"");
   String response=executeCommand(raw,source); sendUdpReply(ip,port,response); addLog(source+" reply \""+response+"\"");
-  if(response=="fan:on"||response=="fan:off"){ String state=fanOn?"state|on":"state|off"; sendUdpReply(ip,port,state); addLog(source+" confirm \""+state+"\""); }
+  if(response=="fan:on"||response=="fan:off") broadcastUdpState();
 }
 
 void setup() {
